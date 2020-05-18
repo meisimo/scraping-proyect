@@ -191,14 +191,55 @@ class GazzeteCollection():
             raise DuplicateGazzetteException(e, not_inserted_gazzettes, documents)
         except PyMongoError as e:
             raise GazzetteNotInsertedException(e, documents)
-  
+
+class DataBase():
+
+    @classmethod
+    def __generate_object_id(cls, number, date):
+        number = str(number)
+        if re.match('^\d+[a-z]{1}', number) is None or 4 < len(number):
+            number = str(random.randint(1,9999))
+        
+        year = complete_number_with_leading_zeros(4, date.year)
+        month = complete_number_with_leading_zeros(2, date.month)
+        day = complete_number_with_leading_zeros(2, date.day)
+        number = complete_number_with_leading_zeros(4, number)
+        
+        object_id = ObjectId( year + month + day + number )
+        return object_id
+    
+    @classmethod
+    def add(cls, collection_name, documents):
+        db = client['digesto']
+        collection = db[collection_name]
+        if not isinstance(documents, list):
+            documents = [documents]
+        
+        for one_document in documents:
+            one_document['_id'] = DataBase.__generate_object_id(one_document['numero'], one_document['fecha'])
+
+        try:        
+            gazzette_initial_amount = collection.count()
+        except Exception:
+            gazzette_initial_amount = 0
+        
+        try:
+            insertion_result =  collection.insert(documents, continue_on_error=True)
+        except DuplicateKeyError as e:
+            gazzette_final_amount = collection.count()
+            inserted_gazzettes = gazzette_initial_amount - gazzette_final_amount
+            not_inserted_gazzettes = len(documents) - inserted_gazzettes
+            raise DuplicateGazzetteException(e, not_inserted_gazzettes, documents)
+        except PyMongoError as e:
+            raise GazzetteNotInsertedException(e, documents)
+
 class GazzeteSpider(scrapy.Spider):
     '''Self defined constants'''
     ORIGIN_URI = 'http://digesto.asamblea.gob.ni'
     REQUEST_URL = ORIGIN_URI + '/consultas/util/ws/proxy.php'
     FIELDS_FORMAT = {
         'numPublica': {
-            'required': True,
+            'required': False,
             'format': re.compile('^\d+'),
             'format_description': 'only numeric field',
         },
@@ -209,8 +250,8 @@ class GazzeteSpider(scrapy.Spider):
         },
         'titulo': {
             'required': True,
-            'format': re.compile(u'Gaceta|Registro|Boletín|Diario|Eco|Tribuna', re.IGNORECASE),
-            'format_description': 'the titl does not make any reference to a gazzette',
+            'format': None,
+            'format_description': None,
         },
     }
     '''Spider properties'''
@@ -219,8 +260,7 @@ class GazzeteSpider(scrapy.Spider):
         ORIGIN_URI + '/consultas/coleccion/',
     ]
     '''DB properties'''
-    gazzete_collection = GazzeteCollection()
-
+    # gazzete_collection = GazzeteCollection()
     
     def parse(self, response):
         folder_ids = response.css('#contentarbol ul li::attr("id")').extract()
@@ -229,19 +269,20 @@ class GazzeteSpider(scrapy.Spider):
         req_body = { 'hddQueryType': 'initgetRdds', 'cole': '' }
         for folder_id in folder_ids:
             cole = folder_id[4:]
+            collection_name = self.folder_name[cole].replace(" ", "_").lower()
             req_body['cole'] = cole
             print("Request folder %s" % self.folder_name[cole])
             try:
                 yield scrapy.FormRequest(
                     url = self.REQUEST_URL,
-                    callback = self.parse_folder(cole),
+                    callback = self.parse_folder( cole, collection_name),
                     formdata = req_body,
                     dont_filter = True
                 )
             except GazzetteScrapingException as e:
                 print(e)
 
-    def parse_folder(self, folder_id):
+    def parse_folder(self, folder_id, collection):
         def _( response ):
             if str(response.status)[:1] != '2':
                 raise BadResponseException(response.request, response)
@@ -267,7 +308,7 @@ class GazzeteSpider(scrapy.Spider):
                 try :
                     yield scrapy.FormRequest(
                         url = self.REQUEST_URL,
-                        callback = self.process_content_list( folder_id, data['txtDatePublishFrom'], data['txtDatePublishTo']),
+                        callback = self.process_content_list(collection, folder_id, data['txtDatePublishFrom'], data['txtDatePublishTo']),
                         formdata = data,
                         dont_filter = True
                     )
@@ -275,8 +316,10 @@ class GazzeteSpider(scrapy.Spider):
                     print(e)
         return _
 
-    def process_content_list(self, cole, date_ini, date_fin):
+    def process_content_list(self, collection, cole, date_ini, date_fin):
         def _(response):
+            sys.stdout.write("Response of request folder %s %s\t" % (self.folder_name[cole], date_ini))
+
             if str(response.status)[:1] != '2':
                 raise BadResponseException(response.request, response)
             if not response.body:
@@ -284,29 +327,29 @@ class GazzeteSpider(scrapy.Spider):
 
             content_list = json.loads(response.text).get('rdds')
             gazzete_list = []
-            sys.stdout.write("Response of request folder %s %s" % (self.folder_name[cole], date_ini))
+
             for content in content_list:
                 try:
                     gazzete = self.get_gazzete_content(content)
                     gazzete_list.append(gazzete)
                 except GazzetteScrapingException as e:
-                    if content['numPublica'] and content['titulo']:
-                        print("%s\t%s" % (e, content['titulo'] if content['titulo'] else '_NO_TITLE_'))
+                    # print(e.detail())
                     pass
                 except Exception as e:
                     print("%s\t %s" % (e.detail(), content['titulo'] if content['titulo'] else '_NO_TITLE_'))
-
+                
             try:
                 inserted_gazzettes = len(gazzete_list)
                 if 0<inserted_gazzettes:
-                    self.gazzete_collection.add(gazzete_list)
+                    DataBase.add(collection, gazzete_list)
                     # for gazzette in gazzete_list:
                     #     print(gazzette['titulo'])
             except DuplicateGazzetteException  as e:
-                # print(e)
+                print(e)
                 inserted_gazzettes -= e.n_not_inserted
             except GazzetteScrapingException as e:
-                print(e.detail())
+                print("Error!")
+                print( e.detail())
                 inserted_gazzettes = -1
             sys.stdout.write("Inserted: %d\n" % inserted_gazzettes)
             # return {'gazzettes_added': inserted_gazzettes}
@@ -317,11 +360,11 @@ class GazzeteSpider(scrapy.Spider):
             if format['required']:
                 if field not in content or not content[field]:
                     raise GazzetteWithEmptyFieldException(field, content)
-            if format['format']:
+            if format['format'] and content[field]:
                 if format['format'].search(content[field]) is None:
                     raise GazzetteWithWrongFormatFieldException(field, format['format_description'], content[field], content)
         return {
             'titulo': content['titulo'],
             'fecha': datetime.datetime.strptime(content['fecPublica'], DATE_FORMAT),
-            'numero': content['numPublica']
+            'numero': content['numPublica'] if content['numPublica'] else random.randint(1,9999)
         }
